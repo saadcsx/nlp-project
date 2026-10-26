@@ -1,0 +1,6 @@
+sentence-transformers>=5.0
+openai>=1.51,<2
+pypdf>=5.0
+numpy>=2.3
+streamlit>=1.50
+python-dotenv>=1.0
