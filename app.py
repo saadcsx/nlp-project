@@ -1,4 +1,7 @@
-"""Streamlit UI for Student Document Q&A (Tier 1 - Basic)."""
+"""Streamlit UI for Student Document Q&A (Tier 2 - Intermediate)."""
+
+import hashlib
+import time
 
 import streamlit as st
 
@@ -15,37 +18,78 @@ except RuntimeError as e:
     client = None
     st.warning(f"{e} Retrieval will still work, but answers won't be generated.")
 
+with st.sidebar:
+    st.header("Settings")
+    chunk_tokens = st.slider("Chunk size (tokens)", 50, 250, rag.DEFAULT_CHUNK_TOKENS, step=10)
+    overlap = st.slider(
+        "Chunk overlap (tokens)",
+        0,
+        min(100, chunk_tokens - 10),
+        min(rag.DEFAULT_OVERLAP, chunk_tokens - 10),
+        step=10,
+    )
+    k = st.slider("Chunks to retrieve (top-k)", 1, 8, rag.DEFAULT_TOP_K)
+    compact = st.checkbox("Remove near-duplicate chunks", value=True)
+    threshold = st.slider(
+        "Duplicate threshold (cosine)",
+        0.80,
+        0.99,
+        rag.DEFAULT_DEDUPE_THRESHOLD,
+        step=0.01,
+        disabled=not compact,
+    )
+
 uploaded = st.file_uploader("Upload a document", type=["pdf", "txt"])
 
 if uploaded is not None:
-    # Embed once per uploaded file; reuse the index for every question.
-    if st.session_state.get("doc_name") != uploaded.name:
+    data = uploaded.getvalue()
+    # Embed once per (document, chunk settings); reuse the index for every question.
+    key = (hashlib.md5(data).hexdigest(), chunk_tokens, overlap)
+    if st.session_state.get("index_key") != key:
         with st.spinner("Loading embedding model, then chunking and embedding the document..."):
-            text = rag.load_document(uploaded.name, uploaded.getvalue())
+            t0 = time.perf_counter()
+            text = rag.load_document(uploaded.name, data)
             try:
-                st.session_state["index"] = rag.build_index(text)
-                st.session_state["doc_name"] = uploaded.name
+                st.session_state["index"] = rag.build_index(text, chunk_tokens, overlap)
             except ValueError as e:
                 st.error(str(e))
                 st.stop()
+            st.session_state["embed_seconds"] = time.perf_counter() - t0
+            st.session_state["index_key"] = key
     index = st.session_state["index"]
-    st.success(f"Indexed **{uploaded.name}** into {len(index.chunks)} chunks.")
+    st.success(
+        f"Indexed **{uploaded.name}** into {len(index.chunks)} chunks "
+        f"in {st.session_state['embed_seconds']:.2f}s "
+        "(the first run includes loading the embedding model)."
+    )
 
-    k = st.slider("Chunks to retrieve (top-k)", 1, 8, 4)
     question = st.text_input("Ask a question about the document")
 
     if question:
-        retrieved = rag.retrieve(index, question, k=k)
+        t0 = time.perf_counter()
+        retrieved, dropped = rag.retrieve(index, question, k=k, compact=compact, threshold=threshold)
+        retrieve_ms = (time.perf_counter() - t0) * 1000
 
         st.subheader("Answer")
+        llm_seconds = None
         if client is None:
             st.info("Set LLM_API_KEY in your .env file to get a generated answer.")
         else:
             try:
                 with st.spinner("Generating answer..."):
-                    st.write(rag.answer_question(client, question, retrieved))
+                    t0 = time.perf_counter()
+                    answer = rag.answer_question(client, question, retrieved)
+                    llm_seconds = time.perf_counter() - t0
+                st.write(answer)
             except Exception as e:  # keep the sources visible even if the LLM call fails
                 st.error(f"The LLM request failed: {e}")
+
+        timing = f"Retrieval: {retrieve_ms:.0f} ms"
+        if llm_seconds is not None:
+            timing += f" · Answer generation: {llm_seconds:.2f} s"
+        if compact:
+            timing += f" · Near-duplicate chunks removed: {dropped}"
+        st.caption(timing)
 
         st.subheader("Sources")
         for n, (chunk_id, score, text) in enumerate(retrieved, start=1):
